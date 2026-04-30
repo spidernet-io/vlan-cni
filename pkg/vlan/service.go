@@ -10,8 +10,12 @@ import (
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
+
+	"github.com/spidernet-io/spiderpool/api/v1/agent/client/daemonset"
+	"github.com/spidernet-io/spiderpool/api/v1/agent/models"
+	spiderpoolopenapi "github.com/spidernet-io/spiderpool/pkg/openapi"
+
 	"github.com/spidernet-io/vlan-cni/pkg/config"
-	"github.com/spidernet-io/vlan-cni/pkg/spclient"
 )
 
 // parseCNIArgs extracts K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
@@ -63,9 +67,11 @@ func splitKV(s string) []string {
 func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, error) {
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+		return nil, fmt.Errorf("failed to open netns %q: %w", args.Netns, err)
 	}
-	defer netns.Close()
+	defer func() {
+		_ = netns.Close()
+	}()
 
 	// Step 1: Parse K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
 	podName, podNamespace, err := parseCNIArgs(args.Args)
@@ -74,44 +80,52 @@ func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, erro
 	}
 
 	// Step 2: Query spiderpool-agent via Unix socket
-	client := spclient.NewClient(spclient.SpiderpoolAgentSocket)
-	assignment, err := client.GetWorkloadEndpoint(podName, podNamespace, args.IfName)
+	// Using the same pattern as spiderpool IPAM: openapi.NewAgentOpenAPIUnixClient
+	client, err := spiderpoolopenapi.NewAgentOpenAPIUnixClient("")
 	if err != nil {
-		return nil, fmt.Errorf("GetWorkloadEndpoint failed: %v", err)
+		return nil, fmt.Errorf("failed to create spiderpool-agent client: %w", err)
 	}
 
-	// Step 3: Create VLAN using assignment
+	// Create params for GetWorkloadendpoint (same pattern as spiderpool's PostIpamIP)
+	params := daemonset.NewGetWorkloadendpointParams()
+	params.PodName = podName
+	params.PodNamespace = podNamespace
+
+	resp, err := client.Daemonset.GetWorkloadendpoint(params)
+	if err != nil {
+		return nil, fmt.Errorf("GetWorkloadendpoint failed: %w", err)
+	}
+
+	// Step 3: Find the interface detail for the requested NIC
+	ifaceDetail := findInterface(resp.Payload.Interfaces, args.IfName)
+	if ifaceDetail == nil {
+		return nil, fmt.Errorf("no assignment for nic %q in spiderpool-agent response", args.IfName)
+	}
+
+	// Step 4: Create VLAN using assignment
 	mtu := n.MTU
 	if mtu == 0 {
 		mtu, _ = GetMTU(n.Master)
 	}
 
-	vlanIf, err := CreateVlan(n.Master, args.IfName, netns, assignment.VlanID, mtu)
+	vlanIf, err := CreateVlan(n.Master, args.IfName, netns, int(ifaceDetail.Vlan), mtu, ifaceDetail.Mac)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create VLAN: %v", err)
+		return nil, fmt.Errorf("failed to create VLAN: %w", err)
 	}
 
-	// Update MAC if provided
-	if assignment.MAC != "" {
-		if err := UpdateMac(args.IfName, assignment.MAC); err != nil {
-			DeleteVlan(args.IfName, netns)
-			return nil, fmt.Errorf("failed to set MAC: %v", err)
-		}
-		vlanIf.Mac = assignment.MAC
-	}
-
-	// Step 4: Build result from assignment IPs (no IPAM call needed)
+	// Step 5: Build result from assignment IPs (no IPAM call needed)
 	result := &current.Result{
 		CNIVersion: n.CNIVersion,
 		Interfaces: []*current.Interface{vlanIf},
 		DNS:        n.DNS,
 	}
 
-	for _, ipStr := range assignment.IPs {
+	// Parse IPs from the assignment
+	ips := getIPsFromInterface(ifaceDetail)
+	for _, ipStr := range ips {
 		ipAddr, ipNet, err := net.ParseCIDR(ipStr)
 		if err != nil {
-			DeleteVlan(args.IfName, netns)
-			return nil, fmt.Errorf("invalid IP from assignment: %s: %v", ipStr, err)
+			return nil, fmt.Errorf("invalid IP from assignment: %s: %w", ipStr, err)
 		}
 		ipNet.IP = ipAddr
 		result.IPs = append(result.IPs, &current.IPConfig{
@@ -121,17 +135,37 @@ func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, erro
 	}
 
 	if len(result.IPs) == 0 {
-		DeleteVlan(args.IfName, netns)
 		return nil, fmt.Errorf("assignment contains no IPs for nic %q", args.IfName)
 	}
 
-	// Step 5: Configure IPs on the VLAN interface
+	// Step 6: Configure IPs on the VLAN interface
 	if err := netns.Do(func(_ ns.NetNS) error {
 		return ipam.ConfigureIface(args.IfName, result)
 	}); err != nil {
-		DeleteVlan(args.IfName, netns)
-		return nil, fmt.Errorf("failed to configure IP: %v", err)
+		return nil, fmt.Errorf("failed to configure IP: %w", err)
 	}
 
 	return result, nil
+}
+
+// findInterface finds the interface detail by name from the list
+func findInterface(interfaces []*models.InterfaceDetail, ifName string) *models.InterfaceDetail {
+	for _, iface := range interfaces {
+		if iface.Interface != nil && *iface.Interface == ifName {
+			return iface
+		}
+	}
+	return nil
+}
+
+// getIPsFromInterface extracts all IPs from the interface detail
+func getIPsFromInterface(iface *models.InterfaceDetail) []string {
+	var ips []string
+	if iface.IPV4 != "" {
+		ips = append(ips, iface.IPV4)
+	}
+	if iface.IPV6 != "" {
+		ips = append(ips, iface.IPV6)
+	}
+	return ips
 }

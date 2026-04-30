@@ -19,7 +19,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -70,9 +69,11 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
-		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+		return fmt.Errorf("failed to open netns %q: %w", args.Netns, err)
 	}
-	defer netns.Close()
+	defer func() {
+		_ = netns.Close()
+	}()
 
 	// Always execute IPAM DEL
 	if err := ipam.ExecDel(n.IPAM.Type, args.StdinData); err != nil {
@@ -83,7 +84,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	err = vlan.DeleteVlan(args.IfName, netns)
 	if err != nil {
 		// Log error but don't fail if interface doesn't exist
-		fmt.Fprintf(os.Stderr, "Warning: failed to delete VLAN interface: %v\n", err)
+		return fmt.Errorf("failed to delete VLAN interface: %w", err)
 	}
 
 	return nil

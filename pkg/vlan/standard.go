@@ -17,27 +17,27 @@ import (
 func CmdAddStandard(args *skel.CmdArgs, n *config.NetConf) (*current.Result, error) {
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+		return nil, fmt.Errorf("failed to open netns %q: %w", args.Netns, err)
 	}
-	defer netns.Close()
+	defer func() {
+		_ = netns.Close()
+	}()
 
-	// Step 1: Create VLAN using config vlanId
-	vlanIf, err := CreateVlan(n.Master, args.IfName, netns, *n.VlanID, n.MTU)
+	// Step 1: Create VLAN using config vlanId (no MAC in standard mode)
+	vlanIf, err := CreateVlan(n.Master, args.IfName, netns, *n.VlanID, n.MTU, "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create VLAN: %v", err)
+		return nil, fmt.Errorf("failed to create VLAN: %w", err)
 	}
 
 	// Step 2: Invoke IPAM
 	r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
 	if err != nil {
-		DeleteVlan(args.IfName, netns)
-		return nil, fmt.Errorf("IPAM failed: %v", err)
+		return nil, fmt.Errorf("IPAM failed: %w", err)
 	}
 
 	// Rollback function
 	rollback := func() {
-		ipam.ExecDel(n.IPAM.Type, args.StdinData)
-		DeleteVlan(args.IfName, netns)
+		_ = ipam.ExecDel(n.IPAM.Type, args.StdinData)
 	}
 
 	result, err := current.NewResultFromResult(r)
@@ -61,7 +61,7 @@ func CmdAddStandard(args *skel.CmdArgs, n *config.NetConf) (*current.Result, err
 		return ipam.ConfigureIface(args.IfName, result)
 	}); err != nil {
 		rollback()
-		return nil, fmt.Errorf("failed to configure IP: %v", err)
+		return nil, fmt.Errorf("failed to configure IP: %w", err)
 	}
 
 	result.DNS = n.DNS

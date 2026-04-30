@@ -177,38 +177,34 @@ In service mode, vlan-cni queries spiderpool-agent via its Unix socket, followin
 
 ### Response
 
-Returns `ipAssignments` map keyed by NIC name:
+Returns `WorkloadEndpointStatus` with interfaces array:
 
 ```json
 {
-  "ipAssignments": {
-    "net1": {
-      "ips": ["192.168.1.100/24"],
-      "vlanId": 100,
+  "podName": "my-pod",
+  "podNamespace": "default",
+  "podUID": "...",
+  "node": "node-1",
+  "interfaces": [
+    {
+      "interface": "net1",
+      "ipv4": "192.168.1.100/24",
+      "ipv4Gateway": "192.168.1.1",
+      "ipv6": "fd00::100/64",
+      "vlan": 100,
       "mac": "aa:bb:cc:dd:ee:ff"
     },
-    "net2": {
-      "ips": ["192.168.2.100/24"],
-      "vlanId": 200,
+    {
+      "interface": "net2",
+      "ipv4": "192.168.2.100/24",
+      "vlan": 200,
       "mac": "aa:bb:cc:dd:ee:00"
     }
-  }
+  ]
 }
 ```
 
-When `nic=net1` is specified, only the matching entry is returned:
-
-```json
-{
-  "ipAssignments": {
-    "net1": {
-      "ips": ["192.168.1.100/24"],
-      "vlanId": 100,
-      "mac": "aa:bb:cc:dd:ee:ff"
-    }
-  }
-}
-```
+The client finds the matching interface by `interface` name.
 ## Execution Flow
 
 ### cmdAdd Flow
@@ -225,19 +221,22 @@ When `nic=net1` is specified, only the matching entry is returned:
      a. Parse K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
 
      b. Connect to spiderpool-agent Unix socket
-        client = NewAgentClient("/var/run/spidernet/spiderpool.sock")
+        // Same pattern as spiderpool IPAM:
+        // spiderpoolAgentAPI, err := openapi.NewAgentOpenAPIUnixClient(socketPath)
+        client, err := NewAgentOpenAPIUnixClient("/var/run/spidernet/spiderpool.sock")
 
-     c. Call GetWorkloadEndpoint
-        assignment = client.GetWorkloadEndpoint(podName, podNamespace, args.IfName)
+     c. Call GetWorkloadEndpoint (similar to spiderpool's PostIpamIP)
+        params := &GetWorkloadEndpointParams{
+            PodName: podName, PodNamespace: podNamespace, Nic: args.IfName,
+        }
+        resp, err := client.Daemonset().GetWorkloadEndpoint(params)
         if err != nil {
             return error("GetWorkloadEndpoint failed: ...")
         }
+        assignment := resp.Payload.IPAssignments[args.IfName]
      
-     d. Create VLAN sub-interface
-        vlanIf = createVlan(master, ifName, assignment.VlanId)
-        if assignment.MAC != "" {
-            updateMac(ifName, assignment.MAC)
-        }
+     d. Create VLAN sub-interface (VLAN and MAC set in one call)
+        vlanIf = createVlan(master, ifName, assignment.VlanId, assignment.MAC)
      
      e. Configure IP on VLAN interface (using IPs from assignment, no IPAM call)
         configureIPs(ifName, assignment.IPs)
@@ -298,32 +297,57 @@ func loadConf(args *skel.CmdArgs) (*NetConf, string, error) {
 
 ### 2. Spiderpool-Agent Client
 
+vlan-cni directly uses spiderpool's generated OpenAPI client (same pattern as spiderpool IPAM):
+
 ```go
-const SpiderpoolAgentSocket = "/var/run/spidernet/spiderpool.sock"
+import (
+    "github.com/spidernet-io/spiderpool/api/v1/agent/client/daemonset"
+    "github.com/spidernet-io/spiderpool/api/v1/agent/models"
+    spiderpoolopenapi "github.com/spidernet-io/spiderpool/pkg/openapi"
+)
 
-// IPAssignment represents a single NIC's network assignment from spiderpool-agent
-type IPAssignment struct {
-    IPs    []string `json:"ips"`              // e.g. ["192.168.1.100/24"]
-    VlanID int      `json:"vlanId"`
-    MAC    string   `json:"mac,omitempty"`
+// Create Unix socket client (same pattern as spiderpool IPAM)
+client, err := spiderpoolopenapi.NewAgentOpenAPIUnixClient("")
+if err != nil {
+    return fmt.Errorf("failed to create spiderpool-agent client: %v", err)
 }
 
-// WorkloadEndpointResponse is the response from GetWorkloadEndpoint
-type WorkloadEndpointResponse struct {
-    IPAssignments map[string]IPAssignment `json:"ipAssignments"` // keyed by NIC name
+// Build parameters
+params := daemonset.NewGetWorkloadendpointParams()
+params.PodName = podName
+params.PodNamespace = podNamespace
+
+// Call GetWorkloadendpoint (similar to spiderpool's PostIpamIP)
+resp, err := client.Daemonset.GetWorkloadendpoint(params)
+if err != nil {
+    return fmt.Errorf("GetWorkloadendpoint failed: %v", err)
 }
 
-// GetWorkloadEndpoint queries spiderpool-agent for the Pod's network assignment.
-// It connects via Unix socket, following the same pattern as spiderpool IPAM
-// (reference: github.com/spidernet-io/spiderpool/cmd/spiderpool/cmd/command_add.go)
-func GetWorkloadEndpoint(podName, podNamespace, nic string) (*IPAssignment, error) {
-    // 1. Create Unix socket HTTP client (same as spiderpool's NewAgentOpenAPIUnixClient)
-    // 2. Call GetWorkloadEndpoint RPC
-    // 3. Find matching NIC entry from ipAssignments map
-    // 4. Validate vlanId range and MAC format
-    return nil, nil
+// Find interface by name
+var ifaceDetail *models.InterfaceDetail
+for _, iface := range resp.Payload.Interfaces {
+    if iface.Interface != nil && *iface.Interface == ifName {
+        ifaceDetail = iface
+        break
+    }
+}
+
+// Extract data
+vlanId := int(ifaceDetail.Vlan)
+mac := ifaceDetail.Mac
+ips := []string{}
+if ifaceDetail.IPV4 != "" {
+    ips = append(ips, ifaceDetail.IPV4)
+}
+if ifaceDetail.IPV6 != "" {
+    ips = append(ips, ifaceDetail.IPV6)
 }
 ```
+
+**Key Types** (from spiderpool generated code):
+- `models.WorkloadEndpointStatus`: Response payload with interfaces array
+- `models.InterfaceDetail`: Per-interface data (name, IPs, VLAN, MAC, routes)
+- `daemonset.GetWorkloadendpointParams`: Query parameters (PodName, PodNamespace)
 
 ## Error Handling
 
@@ -356,14 +380,11 @@ vlan-cni/
 ├── pkg/
 │   ├── config/
 │   │   └── config.go            # NetConf definition
-│   ├── spclient/
-│   │   ├── client.go            # Unix socket client for spiderpool-agent
-│   │   └── types.go             # IPAssignment / WorkloadEndpointResponse types
 │   └── vlan/
-│       ├── interface.go         # VLAN create/delete/update
+│       ├── interface.go         # VLAN create/delete (uses spiderpool client)
 │       ├── standard.go          # Standard mode implementation
 │       └── service.go           # Service mode implementation
-├── go.mod
+├── go.mod                       # Depends on github.com/spidernet-io/spiderpool
 └── README.md
 ```
 
