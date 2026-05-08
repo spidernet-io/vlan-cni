@@ -4,7 +4,6 @@ package vlan
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	current "github.com/containernetworking/cni/pkg/types/100"
@@ -17,6 +16,8 @@ import (
 
 	"github.com/spidernet-io/vlan-cni/pkg/config"
 )
+
+var unixSocketPath = "/var/run/spidernet/spiderpool.sock"
 
 // parseCNIArgs extracts K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
 func parseCNIArgs(cniArgs string) (podName, podNamespace string, err error) {
@@ -62,8 +63,7 @@ func splitKV(s string) []string {
 }
 
 // CmdAddService handles the CNI ADD command in service mode.
-// It queries spiderpool-agent via Unix socket for VLAN/MAC/IP assignment,
-// then creates the VLAN interface and configures IPs directly (no IPAM call).
+// Flow: IPAM alloc → GetWorkloadEndpoint (VLAN/MAC) → CreateVlan → ConfigureIface
 func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, error) {
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
@@ -79,14 +79,24 @@ func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, erro
 		return nil, err
 	}
 
-	// Step 2: Query spiderpool-agent via Unix socket
+	// Step 2: Invoke IPAM to allocate IP
+	r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
+	if err != nil {
+		return nil, fmt.Errorf("IPAM failed: %w", err)
+	}
+
+	result, err := current.NewResultFromResult(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: Query spiderpool-agent via Unix socket to get VLAN ID and MAC
 	// Using the same pattern as spiderpool IPAM: openapi.NewAgentOpenAPIUnixClient
-	client, err := spiderpoolopenapi.NewAgentOpenAPIUnixClient("")
+	client, err := spiderpoolopenapi.NewAgentOpenAPIUnixClient(unixSocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create spiderpool-agent client: %w", err)
 	}
 
-	// Create params for GetWorkloadendpoint (same pattern as spiderpool's PostIpamIP)
 	params := daemonset.NewGetWorkloadendpointParams()
 	params.PodName = podName
 	params.PodNamespace = podNamespace
@@ -96,13 +106,13 @@ func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, erro
 		return nil, fmt.Errorf("GetWorkloadendpoint failed: %w", err)
 	}
 
-	// Step 3: Find the interface detail for the requested NIC
+	// Step 4: Find the interface detail for the requested NIC
 	ifaceDetail := findInterface(resp.Payload.Interfaces, args.IfName)
 	if ifaceDetail == nil {
 		return nil, fmt.Errorf("no assignment for nic %q in spiderpool-agent response", args.IfName)
 	}
 
-	// Step 4: Create VLAN using assignment
+	// Step 5: Create VLAN interface using VLAN ID and MAC from spiderpool-agent
 	mtu := n.MTU
 	if mtu == 0 {
 		mtu, _ = GetMTU(n.Master)
@@ -113,32 +123,13 @@ func CmdAddService(args *skel.CmdArgs, n *config.NetConf) (*current.Result, erro
 		return nil, fmt.Errorf("failed to create VLAN: %w", err)
 	}
 
-	// Step 5: Build result from assignment IPs (no IPAM call needed)
-	result := &current.Result{
-		CNIVersion: n.CNIVersion,
-		Interfaces: []*current.Interface{vlanIf},
-		DNS:        n.DNS,
+	// Step 6: Configure IPs (from IPAM result) on the VLAN interface
+	for _, ipc := range result.IPs {
+		ipc.Interface = current.Int(0)
 	}
+	result.Interfaces = []*current.Interface{vlanIf}
+	result.DNS = n.DNS
 
-	// Parse IPs from the assignment
-	ips := getIPsFromInterface(ifaceDetail)
-	for _, ipStr := range ips {
-		ipAddr, ipNet, err := net.ParseCIDR(ipStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid IP from assignment: %s: %w", ipStr, err)
-		}
-		ipNet.IP = ipAddr
-		result.IPs = append(result.IPs, &current.IPConfig{
-			Interface: current.Int(0),
-			Address:   *ipNet,
-		})
-	}
-
-	if len(result.IPs) == 0 {
-		return nil, fmt.Errorf("assignment contains no IPs for nic %q", args.IfName)
-	}
-
-	// Step 6: Configure IPs on the VLAN interface
 	if err := netns.Do(func(_ ns.NetNS) error {
 		return ipam.ConfigureIface(args.IfName, result)
 	}); err != nil {
@@ -156,16 +147,4 @@ func findInterface(interfaces []*models.InterfaceDetail, ifName string) *models.
 		}
 	}
 	return nil
-}
-
-// getIPsFromInterface extracts all IPs from the interface detail
-func getIPsFromInterface(iface *models.InterfaceDetail) []string {
-	var ips []string
-	if iface.IPV4 != "" {
-		ips = append(ips, iface.IPV4)
-	}
-	if iface.IPV6 != "" {
-		ips = append(ips, iface.IPV6)
-	}
-	return ips
 }

@@ -39,6 +39,13 @@ func CreateVlan(master string, ifName string, netns ns.NetNS, vlanID int, mtu in
 	linkAttrs.Name = tmpName
 	linkAttrs.ParentIndex = m.Attrs().Index
 	linkAttrs.Namespace = netlink.NsFd(int(netns.Fd()))
+	if mac != "" {
+		hwAddr, err := net.ParseMAC(mac)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MAC address %q: %w", mac, err)
+		}
+		linkAttrs.HardwareAddr = hwAddr
+	}
 
 	v := &netlink.Vlan{
 		LinkAttrs: linkAttrs,
@@ -49,23 +56,8 @@ func CreateVlan(master string, ifName string, netns ns.NetNS, vlanID int, mtu in
 		return nil, fmt.Errorf("failed to create vlan: %w", err)
 	}
 
-	// Move to container namespace, rename and set MAC
+	// Move to container namespace and rename
 	err = netns.Do(func(_ ns.NetNS) error {
-		// Set MAC address if provided (before rename to avoid conflicts)
-		if mac != "" {
-			link, err := netlink.LinkByName(tmpName)
-			if err != nil {
-				return fmt.Errorf("failed to find vlan %q: %w", tmpName, err)
-			}
-			hwAddr, err := net.ParseMAC(mac)
-			if err != nil {
-				return fmt.Errorf("invalid MAC address %q: %w", mac, err)
-			}
-			if err := netlink.LinkSetHardwareAddr(link, hwAddr); err != nil {
-				return fmt.Errorf("failed to set MAC address: %w", err)
-			}
-		}
-
 		if err := ip.RenameLink(tmpName, ifName); err != nil {
 			return fmt.Errorf("failed to rename vlan to %q: %w", ifName, err)
 		}
