@@ -12,21 +12,46 @@ GO := go
 GOFLAGS := -v
 LDFLAGS := -ldflags "-s -w"
 
+# Auto-detect host OS and architecture
+HOST_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+HOST_ARCH := $(shell uname -m)
+
+# Map host arch to Go arch
+ifeq ($(HOST_ARCH),x86_64)
+    GOARCH := amd64
+else ifeq ($(HOST_ARCH),aarch64)
+    GOARCH := arm64
+else ifeq ($(HOST_ARCH),arm64)
+    GOARCH := arm64
+else
+    GOARCH := $(HOST_ARCH)
+endif
+
+# Map host OS to Go OS (default: linux)
+ifeq ($(HOST_OS),darwin)
+    GOOS := darwin
+else
+    GOOS := linux
+endif
+
+# Build target name includes OS and arch
+BUILD_TARGET := $(BINARY_NAME)-$(GOOS)-$(GOARCH)
+
 # Test settings
 GINKGO := ginkgo
 TEST_TIMEOUT := 2m
 
-.PHONY: all build unit-tests clean help
+.PHONY: all build unit-tests clean help release
 
 # Default target
 all: build
 
-# Build the binary
+# Build the binary for current platform
 build:
-	@echo "Building $(BINARY_NAME)..."
+	@echo "Building $(BINARY_NAME) for $(GOOS)/$(GOARCH)..."
 	@mkdir -p $(BUILD_DIR)
-	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
-	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
+	GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BUILD_TARGET) $(CMD_PATH)
+	@echo "Build complete: $(BUILD_DIR)/$(BUILD_TARGET)"
 
 # Run unit tests
 unit-tests:
@@ -81,17 +106,17 @@ verify:
 # CI target (build + test)
 ci: deps build unit-tests
 
-# Release build with version info
+# Release build with version info for current platform
 release:
-	@echo "Building release binary..."
+	@echo "Building release binary for $(GOOS)/$(GOARCH)..."
 	@mkdir -p $(BUILD_DIR)
-	$(GO) build $(GOFLAGS) -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
-	@echo "Release build complete: $(BUILD_DIR)/$(BINARY_NAME)"
+	GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build $(GOFLAGS) -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BUILD_DIR)/$(BUILD_TARGET) $(CMD_PATH)
+	@echo "Release build complete: $(BUILD_DIR)/$(BUILD_TARGET)"
 
 # Help
 help:
 	@echo "Available targets:"
-	@echo "  make build       - Build the binary"
+	@echo "  make build       - Build the binary for current platform ($(GOOS)/$(GOARCH))"
 	@echo "  make unit-tests  - Run unit tests with Ginkgo"
 	@echo "  make test        - Run tests with go test"
 	@echo "  make coverage    - Generate test coverage report"
@@ -101,5 +126,5 @@ help:
 	@echo "  make fmt         - Format code"
 	@echo "  make verify      - Verify dependencies"
 	@echo "  make ci          - Run CI pipeline (deps + build + test)"
-	@echo "  make release     - Build release binary"
+	@echo "  make release     - Build release binary for current platform"
 	@echo "  make help        - Show this help"
