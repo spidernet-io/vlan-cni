@@ -38,8 +38,58 @@ var _ = Describe("Config Loading", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cniVersion).To(Equal("1.0.0"))
 			Expect(netConf.Master).To(Equal("eth0"))
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeManual))
 			Expect(netConf.VlanID).NotTo(BeNil())
 			Expect(*netConf.VlanID).To(Equal(100))
+			Expect(netConf.IsServiceMode()).To(BeFalse())
+		})
+
+		It("should load valid manual mode config", func() {
+			conf := `{
+				"cniVersion": "1.0.0",
+				"name": "vlan-network",
+				"type": "vlan",
+				"master": "eth0",
+				"vlanMode": "manual",
+				"vlanId": 100,
+				"ipam": {
+					"type": "spiderpool"
+				}
+			}`
+
+			args := &skel.CmdArgs{
+				StdinData: []byte(conf),
+			}
+
+			netConf, _, err := config.LoadConf(args)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeManual))
+			Expect(netConf.VlanID).NotTo(BeNil())
+			Expect(*netConf.VlanID).To(Equal(100))
+			Expect(netConf.IsServiceMode()).To(BeFalse())
+		})
+
+		It("should default manual mode vlanId to 0", func() {
+			conf := `{
+				"cniVersion": "1.0.0",
+				"name": "vlan-network",
+				"type": "vlan",
+				"master": "eth0",
+				"vlanMode": "manual",
+				"ipam": {
+					"type": "spiderpool"
+				}
+			}`
+
+			args := &skel.CmdArgs{
+				StdinData: []byte(conf),
+			}
+
+			netConf, _, err := config.LoadConf(args)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeManual))
+			Expect(netConf.VlanID).NotTo(BeNil())
+			Expect(*netConf.VlanID).To(Equal(0))
 			Expect(netConf.IsServiceMode()).To(BeFalse())
 		})
 
@@ -61,6 +111,7 @@ var _ = Describe("Config Loading", func() {
 
 			netConf, _, err := config.LoadConf(args)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeManual))
 			Expect(netConf.VlanID).NotTo(BeNil())
 			Expect(*netConf.VlanID).To(Equal(0))
 			Expect(netConf.IsServiceMode()).To(BeFalse())
@@ -129,7 +180,30 @@ var _ = Describe("Config Loading", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cniVersion).To(Equal("1.0.0"))
 			Expect(netConf.Master).To(Equal("eth0"))
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeAuto))
 			Expect(netConf.VlanID).To(BeNil())
+			Expect(netConf.IsServiceMode()).To(BeTrue())
+		})
+
+		It("should load valid auto mode config", func() {
+			conf := `{
+				"cniVersion": "1.0.0",
+				"name": "vlan-network",
+				"type": "vlan",
+				"master": "eth0",
+				"vlanMode": "auto",
+				"ipam": {
+					"type": "spiderpool"
+				}
+			}`
+
+			args := &skel.CmdArgs{
+				StdinData: []byte(conf),
+			}
+
+			netConf, _, err := config.LoadConf(args)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(netConf.VlanMode).To(Equal(config.VlanModeAuto))
 			Expect(netConf.IsServiceMode()).To(BeTrue())
 		})
 	})
@@ -155,6 +229,27 @@ var _ = Describe("Config Loading", func() {
 			Expect(err.Error()).To(ContainSubstring("master"))
 			Expect(err.Error()).To(ContainSubstring("required"))
 		})
+
+		It("should reject invalid vlanMode", func() {
+			conf := `{
+				"cniVersion": "1.0.0",
+				"name": "vlan-network",
+				"type": "vlan",
+				"master": "eth0",
+				"vlanMode": "invalid",
+				"ipam": {
+					"type": "spiderpool"
+				}
+			}`
+
+			args := &skel.CmdArgs{
+				StdinData: []byte(conf),
+			}
+
+			_, _, err := config.LoadConf(args)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid vlanMode"))
+		})
 	})
 })
 
@@ -175,12 +270,24 @@ var _ = Describe("NetConf Mode Detection", func() {
 		netConf.VlanID = intPtr(0)
 		Expect(netConf.IsServiceMode()).To(BeFalse())
 	})
+
+	It("should detect service mode when vlanMode is auto", func() {
+		netConf := &config.NetConf{VlanMode: config.VlanModeAuto}
+		netConf.VlanID = intPtr(100)
+		Expect(netConf.IsServiceMode()).To(BeTrue())
+	})
+
+	It("should detect standard mode when vlanMode is manual", func() {
+		netConf := &config.NetConf{VlanMode: config.VlanModeManual}
+		Expect(netConf.IsServiceMode()).To(BeFalse())
+	})
 })
 
 var _ = Describe("NetConf JSON Serialization", func() {
 	It("should marshal and unmarshal correctly with vlanId", func() {
 		original := &config.NetConf{}
 		original.Master = "eth0"
+		original.VlanMode = config.VlanModeManual
 		original.VlanID = intPtr(100)
 		original.MTU = 1500
 		original.LinkContNs = true
@@ -193,6 +300,7 @@ var _ = Describe("NetConf JSON Serialization", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(parsed.Master).To(Equal("eth0"))
+		Expect(parsed.VlanMode).To(Equal(config.VlanModeManual))
 		Expect(parsed.VlanID).NotTo(BeNil())
 		Expect(*parsed.VlanID).To(Equal(100))
 		Expect(parsed.MTU).To(Equal(1500))
