@@ -11,11 +11,17 @@ import (
 	"github.com/containernetworking/cni/pkg/types"
 )
 
+const (
+	VlanModeManual = "manual"
+	VlanModeAuto   = "auto"
+)
+
 // NetConf represents the CNI network configuration
 type NetConf struct {
 	types.NetConf
-	Master     string `json:"master"`           // Master interface name (required)
-	VlanID     *int   `json:"vlanId,omitempty"` // VLAN ID (0-4094). nil = service mode, non-nil = standard mode
+	Master     string `json:"master"`             // Master interface name (required)
+	VlanMode   string `json:"vlanMode,omitempty"` // VLAN mode: manual or auto
+	VlanID     *int   `json:"vlanId,omitempty"`   // VLAN ID (0-4094). Defaults to 0 in manual mode
 	MTU        int    `json:"mtu,omitempty"`
 	LinkContNs bool   `json:"linkInContainer,omitempty"`
 }
@@ -31,20 +37,38 @@ func LoadConf(args *skel.CmdArgs) (*NetConf, string, error) {
 		return nil, "", fmt.Errorf("\"master\" field is required")
 	}
 
-	if n.VlanID != nil {
-		// Standard mode: validate vlanId range
+	switch n.VlanMode {
+	case "":
+		// Backward compatibility: existing configs selected mode by vlanId presence.
+		if n.VlanID == nil {
+			n.VlanMode = VlanModeAuto
+		} else {
+			n.VlanMode = VlanModeManual
+		}
+	case VlanModeManual, VlanModeAuto:
+	default:
+		return nil, "", fmt.Errorf("invalid vlanMode %q (must be %q or %q)", n.VlanMode, VlanModeManual, VlanModeAuto)
+	}
+
+	if n.VlanMode == VlanModeManual {
+		if n.VlanID == nil {
+			vlanID := 0
+			n.VlanID = &vlanID
+		}
 		if *n.VlanID < 0 || *n.VlanID > 4094 {
 			return nil, "", fmt.Errorf("invalid vlanId %d (must be 0-4094)", *n.VlanID)
 		}
 	}
-	// Service mode (VlanID == nil): no additional config validation needed,
-	// will connect to spiderpool-agent Unix socket at runtime
+	// Auto mode gets VLAN dynamically from IPAM/spiderpool-agent at runtime.
 
 	return n, n.CNIVersion, nil
 }
 
-// IsServiceMode returns true if service mode is enabled (vlanId not set)
+// IsServiceMode returns true if VLAN auto mode is enabled.
 func (n *NetConf) IsServiceMode() bool {
+	if n.VlanMode != "" {
+		return n.VlanMode == VlanModeAuto
+	}
 	return n.VlanID == nil
 }
 
@@ -65,6 +89,9 @@ func (n *NetConf) MarshalJSON() ([]byte, error) {
 	// Add NetConf-specific fields
 	if n.Master != "" {
 		combined["master"] = n.Master
+	}
+	if n.VlanMode != "" {
+		combined["vlanMode"] = n.VlanMode
 	}
 	if n.VlanID != nil {
 		combined["vlanId"] = *n.VlanID
@@ -100,6 +127,11 @@ func (n *NetConf) UnmarshalJSON(data []byte) error {
 	if v, ok := raw["master"]; ok {
 		if s, ok := v.(string); ok {
 			n.Master = s
+		}
+	}
+	if v, ok := raw["vlanMode"]; ok {
+		if s, ok := v.(string); ok {
+			n.VlanMode = s
 		}
 	}
 	if v, ok := raw["vlanId"]; ok {

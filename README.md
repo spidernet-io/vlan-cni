@@ -10,38 +10,40 @@ A CNI plugin that extends the [community VLAN CNI](https://github.com/containern
 
 vlan-cni is a CNI plugin for Kubernetes that creates VLAN sub-interfaces inside Pod network namespaces. It supports two operating modes:
 
-- **Standard mode** — statically configure a VLAN ID in the CNI config, identical to the upstream community plugin behavior.
-- **Service mode** — dynamically retrieve VLAN ID, MAC address, and IP assignments from spiderpool-agent at Pod creation time, enabling cloud IaaS-driven network allocation without any static config.
+- **Manual mode** — statically configure a VLAN ID in the CNI config. If `vlanId` is omitted, it defaults to 0.
+- **Auto mode** — dynamically retrieve VLAN ID and MAC address from spiderpool-agent after IPAM allocation.
 
 ## Key Features
 
-- **Dual mode** — auto-selects standard or service mode based on whether `vlanId` is present in the CNI config; no extra flag needed.
-- **Dynamic VLAN allocation** — in service mode, queries spiderpool-agent via Unix socket (`/var/run/spidernet/spiderpool.sock`) using spiderpool's official OpenAPI client.
-- **MAC address assignment** — in service mode, the MAC address returned by spiderpool-agent is applied directly to the VLAN interface at creation time.
+- **Dual mode** — use `vlanMode: manual` or `vlanMode: auto`; omitted `vlanMode` keeps legacy mode selection by `vlanId` presence.
+- **Dynamic VLAN allocation** — in auto mode, queries spiderpool-agent via Unix socket (`/var/run/spidernet/spiderpool.sock`) using spiderpool's official OpenAPI client.
+- **MAC address assignment** — in auto mode, the MAC address returned by spiderpool-agent is applied directly to the VLAN interface at creation time.
 - **Backward compatible** — all existing CNI configs that include `vlanId` continue to work unchanged.
-- **Zero-value safe** — `"vlanId": 0` (IEEE 802.1Q priority tagging) is treated as standard mode, not service mode.
+- **Zero-value safe** — `"vlanId": 0` (IEEE 802.1Q priority tagging) is treated as manual mode, not auto mode.
 
 ## Differences from Community VLAN CNI
 
 | Feature | Community VLAN CNI | vlan-cni |
 |---|---|---|
 | VLAN ID source | Static config only | Static config **or** spiderpool-agent (dynamic) |
-| MAC address | Not managed | Set from spiderpool-agent response in service mode |
-| IP assignment | Delegated to IPAM plugin | IPAM plugin (standard) or spiderpool-agent response (service) |
+| MAC address | Not managed | Set from spiderpool-agent response in auto mode |
+| IP assignment | Delegated to IPAM plugin | Delegated to IPAM plugin |
 | spiderpool integration | None | Native Unix socket client via `GetWorkloadEndpoint` RPC |
-| Mode selection | N/A | Auto-detected from `vlanId` presence |
+| Mode selection | N/A | Explicit `vlanMode`, with legacy detection from `vlanId` presence |
 
 ## How It Works
 
 ### Mode Selection
 
-| CNI Config | Go Value | Mode |
+| CNI Config | Effective Mode | VLAN Source |
 |---|---|---|
-| `"vlanId": 100` | `*int = &100` | Standard |
-| `"vlanId": 0` | `*int = &0` | Standard (priority tagging) |
-| field absent | `*int = nil` | Service |
+| `"vlanMode": "manual", "vlanId": 100` | Manual | Configured `vlanId` |
+| `"vlanMode": "manual"` | Manual | Default `vlanId` 0 |
+| `"vlanMode": "auto"` | Auto | IPAM/spiderpool-agent |
+| `"vlanId": 100` | Manual (legacy) | Configured `vlanId` |
+| field absent | Auto (legacy) | IPAM/spiderpool-agent |
 
-### Standard Mode Flow
+### Manual Mode Flow
 
 ```
 1. Create VLAN sub-interface using vlanId from config
@@ -49,14 +51,15 @@ vlan-cni is a CNI plugin for Kubernetes that creates VLAN sub-interfaces inside 
 3. Configure IP on VLAN interface
 ```
 
-### Service Mode Flow
+### Auto Mode Flow
 
 ```
 1. Parse K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
-2. Connect to spiderpool-agent Unix socket
-3. Call GetWorkloadEndpoint(podName, podNamespace) → VLAN ID, MAC, IPs
-4. Create VLAN sub-interface and set MAC (in one step)
-5. Configure IPs directly (no IPAM call)
+2. Invoke IPAM plugin to allocate IP
+3. Connect to spiderpool-agent Unix socket
+4. Call GetWorkloadEndpoint(podName, podNamespace) → VLAN ID, MAC
+5. Create VLAN sub-interface and set MAC
+6. Configure IP from IPAM result on VLAN interface
 ```
 
 ## Configuration
@@ -66,12 +69,15 @@ vlan-cni is a CNI plugin for Kubernetes that creates VLAN sub-interfaces inside 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `master` | string | Yes | Host network interface to attach the VLAN to |
-| `vlanId` | int | No | VLAN ID (0–4094). Absent = service mode |
+| `vlanMode` | string | No | VLAN mode: `manual` or `auto`. If omitted, legacy mode detection is used |
+| `vlanId` | int | No | VLAN ID (0-4094). Effective in `manual` mode, defaults to 0 |
 | `mtu` | int | No | MTU for the VLAN interface. Defaults to master MTU |
 | `linkInContainer` | bool | No | Whether the master link is in the container namespace |
-| `ipam` | object | Standard mode | IPAM plugin config (not used in service mode) |
+| `ipam` | object | Yes | IPAM plugin config |
 
-### Standard Mode
+When `vlanMode` is omitted, existing behavior is preserved: configs with `vlanId` use manual mode, and configs without `vlanId` use auto mode.
+
+### Manual Mode
 
 ```json
 {
@@ -79,6 +85,7 @@ vlan-cni is a CNI plugin for Kubernetes that creates VLAN sub-interfaces inside 
   "name": "vlan-network",
   "type": "vlan",
   "master": "eth0",
+  "vlanMode": "manual",
   "vlanId": 100,
   "ipam": {
     "type": "spiderpool"
@@ -86,24 +93,28 @@ vlan-cni is a CNI plugin for Kubernetes that creates VLAN sub-interfaces inside 
 }
 ```
 
-### Service Mode
+### Auto Mode
 
 ```json
 {
   "cniVersion": "1.0.0",
   "name": "vlan-network",
   "type": "vlan",
-  "master": "eth0"
+  "master": "eth0",
+  "vlanMode": "auto",
+  "ipam": {
+    "type": "spiderpool"
+  }
 }
 ```
 
-> In service mode, spiderpool-agent must be running and its Unix socket must be accessible at `/var/run/spidernet/spiderpool.sock`.
+> In auto mode, vlan-cni dynamically gets VLAN information via IPAM/spiderpool-agent. spiderpool-agent must be running and its Unix socket must be accessible at `/var/run/spidernet/spiderpool.sock`.
 
 ## Requirements
 
 - Linux kernel with 802.1Q VLAN support
 - Go 1.22+
-- [spiderpool](https://github.com/spidernet-io/spiderpool) deployed in the cluster (service mode only)
+- [spiderpool](https://github.com/spidernet-io/spiderpool) deployed in the cluster (auto mode only)
 
 ## Building
 

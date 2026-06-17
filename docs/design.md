@@ -1,23 +1,28 @@
 # VLAN CNI with External VLAN Service Specification
 
-Enable vlan-cni to retrieve VLAN configuration from spiderpool-agent, supporting both standard (static config) and service (dynamic allocation) deployment modes.
+Enable vlan-cni to retrieve VLAN configuration from static config or spiderpool-agent, supporting both manual (static config) and auto (dynamic allocation) deployment modes.
 
 ## Overview
 
 This CNI plugin extends [community VLAN CNI](https://github.com/containernetworking/plugins/tree/main/plugins/main/vlan) with:
 
-- **Service-driven VLAN allocation** - Query spiderpool-agent via Unix socket for VLAN ID, MAC, and IP assignments
-- **Dual execution modes** - Automatic mode selection based on whether `vlanId` is present in configuration
-- **Backward compatible** - Existing configs with `vlanId` work without changes (standard mode)
+- **Auto VLAN allocation** - Query spiderpool-agent via Unix socket for VLAN ID and MAC after IPAM allocation
+- **Dual execution modes** - Explicit `vlanMode` selection with `manual` and `auto`
+- **Backward compatible** - Existing configs with `vlanId` work without changes as manual mode
 
 ### Mode Selection
 
-The mode is determined by whether `vlanId` is present in the CNI JSON configuration:
+The mode is determined by `vlanMode` in the CNI JSON configuration:
 
-- **`vlanId` present** (including `"vlanId": 0`) → **Standard Mode**: use the configured VLAN ID directly
-- **`vlanId` absent** → **Service Mode**: call spiderpool-agent `GetWorkloadEndpoint` to obtain VLAN ID, MAC, and IPs
+- **`vlanMode: manual`** → **Manual Mode**: use the configured VLAN ID directly; missing `vlanId` defaults to 0
+- **`vlanMode: auto`** → **Auto Mode**: call IPAM, then spiderpool-agent `GetWorkloadEndpoint` to obtain VLAN ID and MAC
 
-> **Design Note**: `VlanID` uses `*int` (pointer) type in Go to distinguish between "not configured" (`nil`) and "configured as 0" (`&0`). VLAN ID 0 is valid in IEEE 802.1Q (priority tagging), so we cannot use the zero value to mean "unset".
+When `vlanMode` is omitted, legacy mode detection is preserved:
+
+- **`vlanId` present** (including `"vlanId": 0`) → **Manual Mode**
+- **`vlanId` absent** → **Auto Mode**
+
+> **Design Note**: `VlanID` uses `*int` (pointer) type in Go to distinguish between "not configured" (`nil`) and "configured as 0" (`&0`). VLAN ID 0 is valid in IEEE 802.1Q (priority tagging), and manual mode defaults missing `vlanId` to 0.
 
 ### Execution Flow
 
@@ -35,8 +40,8 @@ The mode is determined by whether `vlanId` is present in the CNI JSON configurat
                      |         
                      v              
             +------------------+
-            | vlanId present   |
-            | in config?       |
+            | vlanMode manual  |
+            | or legacy vlanId?|
             +--------+---------+
                      |         
                      v   
@@ -44,7 +49,7 @@ The mode is determined by whether `vlanId` is present in the CNI JSON configurat
          | Yes                     | No (nil)
          v                         v
 +------------------+      +--------+---------+
-| Standard Mode    |      | Invoke IPAM      |
+| Manual Mode      |      | Invoke IPAM      |
 |                  |      | allocate IP      |
 | 1. Create VLAN   |      +--------+---------+
 |    (config vlanId)|               |
@@ -73,18 +78,18 @@ The mode is determined by whether `vlanId` is present in the CNI JSON configurat
 - IP config fails         -> Rollback + Error
 ```
 
-### Mode 1: Standard Mode (vlanId present in config)
+### Mode 1: Manual Mode
 
 Use when VLAN information is statically configured.
 
 **Flow**:
 ```
-1. Create VLAN sub-interface using config vlanId
+1. Create VLAN sub-interface using config vlanId, defaulting to 0 when omitted
 2. Invoke IPAM to allocate IP
 3. Configure IP on VLAN interface
 ```
 
-### Mode 2: Service Mode (vlanId absent in config)
+### Mode 2: Auto Mode
 
 Use when VLAN information is dynamically allocated by external service (e.g., cloud IaaS).
 The vlan-cni connects to spiderpool-agent via Unix socket (`/var/run/spidernet/spiderpool.sock`) and calls `GetWorkloadEndpoint`.
@@ -105,23 +110,25 @@ The vlan-cni connects to spiderpool-agent via Unix socket (`/var/run/spidernet/s
 type NetConf struct {
     types.NetConf
     Master     string `json:"master"`                    // Master interface name (required)
-    VlanID     *int   `json:"vlanId,omitempty"`          // VLAN ID (0-4094). nil = service mode, non-nil = standard mode
+    VlanMode   string `json:"vlanMode,omitempty"`        // VLAN mode: manual or auto
+    VlanID     *int   `json:"vlanId,omitempty"`          // VLAN ID (0-4094). Defaults to 0 in manual mode
     MTU        int    `json:"mtu,omitempty"`
     LinkContNs bool   `json:"linkInContainer,omitempty"`
 }
 ```
 
-> **Note**: Service mode does not require any additional configuration field. The vlan-cni automatically connects to the spiderpool-agent Unix socket at a well-known path.
+> **Note**: When `vlanMode` is omitted, legacy mode detection is preserved: `vlanId` present means manual mode, and `vlanId` absent means auto mode.
 
 ### Configuration Examples
 
-**Standard Mode** (vlanId present → static VLAN):
+**Manual Mode** (`vlanMode: manual` → static VLAN):
 ```json
 {
   "cniVersion": "1.0.0",
   "name": "vlan-network",
   "type": "vlan",
   "master": "eth0",
+  "vlanMode": "manual",
   "vlanId": 100,
   "ipam": {
     "type": "spiderpool"
@@ -129,27 +136,28 @@ type NetConf struct {
 }
 ```
 
-**Standard Mode with Priority Tagging** (vlanId = 0):
+**Manual Mode with Priority Tagging** (`vlanId` omitted → defaults to 0):
 ```json
 {
   "cniVersion": "1.0.0",
   "name": "vlan-network",
   "type": "vlan",
   "master": "eth0",
-  "vlanId": 0,
+  "vlanMode": "manual",
   "ipam": {
     "type": "spiderpool"
   }
 }
 ```
 
-**Service Mode** (vlanId absent → dynamic VLAN from cloud IaaS):
+**Auto Mode** (`vlanMode: auto` → dynamic VLAN from IPAM/spiderpool-agent):
 ```json
 {
   "cniVersion": "1.0.0",
   "name": "vlan-network",
   "type": "vlan",
   "master": "eth0",
+  "vlanMode": "auto",
   "ipam": {
     "type": "spiderpool"
   }
@@ -212,20 +220,26 @@ The client finds the matching interface by `interface` name.
 ```
 1. Load configuration
    - Validate master interface is specified
-   - Determine mode: standard (VlanID != nil) or service (VlanID == nil)
-   - In standard mode: validate *VlanID is in range (0-4094)
+   - Determine mode from vlanMode, with legacy fallback to vlanId presence
+   - In manual mode: default missing vlanId to 0 and validate range (0-4094)
 
 2. Open network namespace
 
-3. IF service mode (VlanID == nil):
+3. IF auto mode:
      a. Parse K8S_POD_NAME and K8S_POD_NAMESPACE from CNI_ARGS
 
-     b. Connect to spiderpool-agent Unix socket
+     b. Invoke IPAM
+        result = ipam.ExecAdd(n.IPAM.Type, args.StdinData)
+        if err != nil {
+            return error("IPAM failed: ...")
+        }
+
+     c. Connect to spiderpool-agent Unix socket
         // Same pattern as spiderpool IPAM:
         // spiderpoolAgentAPI, err := openapi.NewAgentOpenAPIUnixClient(socketPath)
         client, err := NewAgentOpenAPIUnixClient("/var/run/spidernet/spiderpool.sock")
 
-     c. Call GetWorkloadEndpoint (similar to spiderpool's PostIpamIP)
+     d. Call GetWorkloadEndpoint (similar to spiderpool's PostIpamIP)
         params := &GetWorkloadEndpointParams{
             PodName: podName, PodNamespace: podNamespace, Nic: args.IfName,
         }
@@ -235,13 +249,13 @@ The client finds the matching interface by `interface` name.
         }
         assignment := resp.Payload.IPAssignments[args.IfName]
      
-     d. Create VLAN sub-interface (VLAN and MAC set in one call)
+     e. Create VLAN sub-interface (VLAN and MAC set in one call)
         vlanIf = createVlan(master, ifName, assignment.VlanId, assignment.MAC)
      
-     e. Configure IP on VLAN interface (using IPs from assignment, no IPAM call)
-        configureIPs(ifName, assignment.IPs)
+     f. Configure IP on VLAN interface using IPAM result
+        ipam.ConfigureIface(ifName, result)
 
-4. IF standard mode (VlanID != nil):
+4. IF manual mode:
      a. Create VLAN sub-interface using config vlanId
         vlanIf = createVlan(master, ifName, *n.VlanID)
      
